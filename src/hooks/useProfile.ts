@@ -22,6 +22,12 @@ export type ProfileData = {
   colorBlindMode: boolean;
   audioEnabled: boolean;
   coins: number;
+  inventory: {
+    shield: number;
+    freeze: number;
+    autoMatch: number;
+  };
+  lastSpinTimestamp: number;
   matchHistory: MatchHistoryEntry[];
 };
 
@@ -36,6 +42,12 @@ const DEFAULT_PROFILE: ProfileData = {
   colorBlindMode: false,
   audioEnabled: true,
   coins: 100, // starting coins
+  inventory: {
+    shield: 1,
+    freeze: 1,
+    autoMatch: 1,
+  },
+  lastSpinTimestamp: 0,
   matchHistory: [],
 };
 
@@ -65,6 +77,62 @@ export function useProfile() {
 
   const addCoins = (amount: number) => {
     updateProfile({ coins: profile.coins + amount });
+  };
+
+  const updateInventory = (updates: Partial<ProfileData["inventory"]>) => {
+    setProfile((prev) => {
+      const next: ProfileData = {
+        ...prev,
+        inventory: {
+          ...prev.inventory,
+          ...updates,
+        },
+      };
+      localStorage.setItem("puzzify_profile", JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const addPowerup = (type: keyof ProfileData["inventory"], amount: number = 1) => {
+    setProfile((prev) => {
+      const next: ProfileData = {
+        ...prev,
+        inventory: {
+          ...prev.inventory,
+          [type]: Math.max(0, prev.inventory[type] + amount),
+        },
+      };
+      localStorage.setItem("puzzify_profile", JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const usePowerup = (type: keyof ProfileData["inventory"]) => {
+    let consumed = false;
+    setProfile((prev) => {
+      if (prev.inventory[type] <= 0) {
+        return prev;
+      }
+      consumed = true;
+      const next: ProfileData = {
+        ...prev,
+        inventory: {
+          ...prev.inventory,
+          [type]: prev.inventory[type] - 1,
+        },
+      };
+      localStorage.setItem("puzzify_profile", JSON.stringify(next));
+      return next;
+    });
+    return consumed;
+  };
+
+  const canSpin = () => {
+    return Date.now() - profile.lastSpinTimestamp >= 24 * 60 * 60 * 1000;
+  };
+
+  const markSpinNow = () => {
+    updateProfile({ lastSpinTimestamp: Date.now() });
   };
 
   const recordGame = (
@@ -99,5 +167,16 @@ export function useProfile() {
     });
   };
 
-  return { profile, updateProfile, addCoins, recordGame, isLoaded };
+  return {
+    profile,
+    updateProfile,
+    addCoins,
+    updateInventory,
+    addPowerup,
+    usePowerup,
+    canSpin,
+    markSpinNow,
+    recordGame,
+    isLoaded
+  };
 }

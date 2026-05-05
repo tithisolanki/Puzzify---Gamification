@@ -8,9 +8,11 @@ import { HUD } from "@/components/HUD";
 import { LevelType, TileData, useGameLogic } from "@/hooks/useGameLogic";
 import { useProfile } from "@/hooks/useProfile";
 import { GameMode, useMultiplayer } from "@/hooks/useMultiplayer";
-import { Settings, ShoppingCart, User, Crown, Activity, EyeOff, Volume2, Star, Target, Lightbulb, Users, ShieldAlert, Zap, Pause, ArrowLeft, BookOpen, Map, Hash, DoorOpen, Globe, Camera, CameraOff, Shield, Snowflake, Wand2 } from "lucide-react";
+import { useAudio } from "@/hooks/useAudio";
+import { Settings, ShoppingCart, User, Crown, Activity, EyeOff, Volume2, Star, Target, Lightbulb, Users, ShieldAlert, Zap, Pause, ArrowLeft, BookOpen, Map, Hash, DoorOpen, Globe, Camera, CameraOff, Shield, Snowflake, Wand2, Gift, Gamepad2 } from "lucide-react";
+import { SpinWheel, type WheelSegment } from "@/components/SpinWheel";
 
-type Screen = "Menu" | "MultiplayerMenu" | "RoomLobby" | "Matchmaking" | "Play" | "Settings" | "Store" | "Profile" | "Manual";
+type Screen = "Menu" | "MultiplayerMenu" | "RoomLobby" | "Matchmaking" | "Play" | "Settings" | "Store" | "Profile" | "Manual" | "Rewards";
 const MODE_CARDS: { id: GameMode; title: string; description: string }[] = [
   {
     id: "normal",
@@ -53,14 +55,20 @@ export default function Home() {
   const [shieldAbsorbing, setShieldAbsorbing] = useState(false);
   const [frozenUntil, setFrozenUntil] = useState(0);
   const [powerupCooldown, setPowerupCooldown] = useState(0);
+  const [spinResult, setSpinResult] = useState<string | null>(null);
+  const [spinVisualRotation, setSpinVisualRotation] = useState(0);
+  const [isSpinning, setIsSpinning] = useState(false);
   const [nowMs, setNowMs] = useState(0);
+  const [gameOverSoundPlayed, setGameOverSoundPlayed] = useState(false);
   const autoCameraStartedRef = useRef(false);
+
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const hasRecordedGameRef = useRef(false);
 
-  const { profile, updateProfile, recordGame, isLoaded } = useProfile();
+  const { profile, updateProfile, recordGame, isLoaded, addCoins, addPowerup, usePowerup, canSpin, markSpinNow } = useProfile();
+  const { playClick, playPowerup, playWin, playLose } = useAudio(profile.audioEnabled);
   const mp = useMultiplayer();
 
   // Initialize game logic with seed, audio settings, and custom time limits
@@ -75,6 +83,8 @@ export default function Home() {
   const canSolve = (!isMultiplayer || mp.activeMode !== "solver_saboteur" || mp.myRole === "solver") && !isFrozen;
   const isInverted = invertMovesRemaining > 0;
   const currentMillis = nowMs;
+  const spinRemainingMs = Math.max(0, (profile.lastSpinTimestamp + 24 * 60 * 60 * 1000) - nowMs);
+  const canSpinNow = canSpin();
   const isFullInterferenceBurst = nowMs < allInterferenceUntil;
   const boardTiles: TileData[] = isMultiplayer && mp.activeMode === "solver_saboteur" && mp.myRole === "saboteur" && mp.opponentTileSnapshot?.length
     ? (mp.opponentTileSnapshot as TileData[])
@@ -257,6 +267,67 @@ export default function Home() {
     game.initGame();
   };
 
+  const formatCooldown = (ms: number) => {
+    const totalSeconds = Math.ceil(ms / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    return `${hours}h ${minutes}m ${seconds}s`;
+  };
+
+  // Wheel segments — order must match rewardPool below
+  const WHEEL_SEGMENTS: WheelSegment[] = [
+    { label: "50 Coins",      subLabel: "+50",  color: "#0ea5e9", glowColor: "rgba(14,165,233,0.6)",  emoji: "🪙" },
+    { label: "100 Coins",     subLabel: "+100", color: "#8b5cf6", glowColor: "rgba(139,92,246,0.6)",  emoji: "💰" },
+    { label: "Shield",        subLabel: "+1",   color: "#3b82f6", glowColor: "rgba(59,130,246,0.6)",  emoji: "🛡️" },
+    { label: "Freeze",        subLabel: "+1",   color: "#06b6d4", glowColor: "rgba(6,182,212,0.6)",   emoji: "❄️" },
+    { label: "Auto-Match",    subLabel: "+1",   color: "#d946ef", glowColor: "rgba(217,70,239,0.6)",  emoji: "✨" },
+    { label: "50 Coins",      subLabel: "+50",  color: "#f59e0b", glowColor: "rgba(245,158,11,0.6)",  emoji: "🪙" },
+  ];
+  const NUM_SEGMENTS = WHEEL_SEGMENTS.length;
+  const SEG_ANGLE = 360 / NUM_SEGMENTS;
+
+  const handleDailySpin = () => {
+    if (!canSpinNow || isSpinning) return;
+    playClick();
+
+    const roll = Math.random();
+    const thresholds = [0.30, 0.55, 0.70, 0.82, 0.92, 1.00];
+    const rewards = [
+      { segIndex: 0, label: "50 Coins",      apply: () => addCoins(50) },
+      { segIndex: 1, label: "100 Coins",     apply: () => addCoins(100) },
+      { segIndex: 2, label: "Shield +1",     apply: () => addPowerup("shield", 1) },
+      { segIndex: 3, label: "Freeze +1",     apply: () => addPowerup("freeze", 1) },
+      { segIndex: 4, label: "Auto-Match +1", apply: () => addPowerup("autoMatch", 1) },
+      { segIndex: 5, label: "50 Coins",      apply: () => addCoins(50) },
+    ];
+    const winningReward = rewards.find((_, i) => roll <= thresholds[i]) ?? rewards[0];
+    const { segIndex } = winningReward;
+
+    // Compute target rotation so that the pointer (top) lands at the center of the winning segment.
+    // The wheel SVG draws segment[i] starting at angle i * SEG_ANGLE.
+    // Pointer is at the top. To land segment[i]'s center under the pointer,
+    // we need the wheel to rotate so that -(segIndex * SEG_ANGLE + SEG_ANGLE/2) degrees is at top.
+    // Add full extra spins for drama.
+    const landAngle = -(segIndex * SEG_ANGLE + SEG_ANGLE / 2);
+    const extraSpins = 5 * 360;
+    const currentNormalized = ((spinVisualRotation % 360) + 360) % 360;
+    const targetNormalized = ((landAngle % 360) + 360) % 360;
+    let delta = targetNormalized - currentNormalized;
+    if (delta <= 0) delta += 360;
+    const newRotation = spinVisualRotation + extraSpins + delta;
+
+    winningReward.apply();
+    markSpinNow();
+    setIsSpinning(true);
+    setSpinResult(null);
+    setSpinVisualRotation(newRotation);
+    setTimeout(() => {
+      setIsSpinning(false);
+      setSpinResult(`🎉 You won ${winningReward.label}!`);
+    }, 3600);
+  };
+
   const startCamera = async () => {
     try {
       if (!navigator.mediaDevices?.getUserMedia) {
@@ -368,26 +439,29 @@ export default function Home() {
   };
 
   const startPublicMatchmaking = () => {
+    playClick();
     setIsMultiplayer(true);
     setIsPaused(false);
     setShowHeatmap(false);
     setScreen("Matchmaking");
-    mp.joinMatchmaking(matchmakingDifficulty);
+    mp.joinMatchmaking(matchmakingDifficulty, { gamerName: profile.gamerName, photoDataUrl: profile.photoDataUrl });
   };
 
   const handleCreateRoom = () => {
+    playClick();
     setIsMultiplayer(true);
     setIsPaused(false);
     setShowHeatmap(false);
-    mp.createPrivateRoom();
+    mp.createPrivateRoom({ gamerName: profile.gamerName, photoDataUrl: profile.photoDataUrl });
   };
 
   const handleJoinRoom = () => {
+    playClick();
     if (joinCodeInput.trim().length === 6) {
       setIsMultiplayer(true);
       setIsPaused(false);
       setShowHeatmap(false);
-      mp.joinPrivateRoom(joinCodeInput.trim());
+      mp.joinPrivateRoom(joinCodeInput.trim(), { gamerName: profile.gamerName, photoDataUrl: profile.photoDataUrl });
     }
   };
 
@@ -437,87 +511,119 @@ export default function Home() {
   })();
 
   return (
-    <main className="min-h-screen bg-[var(--background)] text-white overflow-hidden flex flex-col relative font-sans">
+    <main
+      className="min-h-screen text-white overflow-hidden flex flex-col relative font-sans bg-cover bg-center"
+      style={{ backgroundImage: "url('/bg.png')" }}
+    >
 
       {/* Decorative background elements */}
       <div className="absolute top-[-20%] left-[-10%] w-[50%] h-[50%] bg-[var(--primary)] rounded-full blur-[150px] opacity-20 pointer-events-none" />
       <div className="absolute bottom-[-20%] right-[-10%] w-[50%] h-[50%] bg-[var(--accent)] rounded-full blur-[150px] opacity-20 pointer-events-none" />
 
+      {/* Global Sidebar / Dock */}
+      <aside className="hidden md:flex fixed left-4 top-1/2 -translate-y-1/2 z-40 w-20 rounded-3xl glass-panel p-3 flex-col gap-3 border border-cyan-300/20">
+        <button onClick={() => { playClick(); setScreen("Menu"); }} className={`p-3 rounded-xl transition ${screen === "Menu" ? "bg-[var(--primary)]/25" : "bg-white/5 hover:bg-white/15"}`}><Gamepad2 className="mx-auto" size={20} /></button>
+        <button onClick={() => { playClick(); setScreen("Rewards"); }} className={`p-3 rounded-xl transition ${screen === "Rewards" ? "bg-[var(--primary)]/25" : "bg-white/5 hover:bg-white/15"}`}><Gift className="mx-auto" size={20} /></button>
+        <button onClick={() => { playClick(); setScreen("Store"); }} className={`p-3 rounded-xl transition ${screen === "Store" ? "bg-[var(--primary)]/25" : "bg-white/5 hover:bg-white/15"}`}><ShoppingCart className="mx-auto" size={20} /></button>
+        <button onClick={() => { playClick(); setScreen("Profile"); }} className={`p-3 rounded-xl transition ${screen === "Profile" ? "bg-[var(--primary)]/25" : "bg-white/5 hover:bg-white/15"}`}><User className="mx-auto" size={20} /></button>
+      </aside>
+      <nav className="md:hidden fixed bottom-3 left-1/2 -translate-x-1/2 z-40 glass-panel rounded-2xl px-2 py-2 flex items-center gap-2 border border-cyan-300/20">
+        <button onClick={() => { playClick(); setScreen("Menu"); }} className={`p-2 rounded-lg ${screen === "Menu" ? "bg-[var(--primary)]/25" : "bg-white/5"}`}><Gamepad2 size={18} /></button>
+        <button onClick={() => { playClick(); setScreen("Rewards"); }} className={`p-2 rounded-lg ${screen === "Rewards" ? "bg-[var(--primary)]/25" : "bg-white/5"}`}><Gift size={18} /></button>
+        <button onClick={() => { playClick(); setScreen("Store"); }} className={`p-2 rounded-lg ${screen === "Store" ? "bg-[var(--primary)]/25" : "bg-white/5"}`}><ShoppingCart size={18} /></button>
+        <button onClick={() => { playClick(); setScreen("Profile"); }} className={`p-2 rounded-lg ${screen === "Profile" ? "bg-[var(--primary)]/25" : "bg-white/5"}`}><User size={18} /></button>
+      </nav>
+
       {/* Header */}
-      <header className="w-full p-4 md:p-6 flex justify-between items-center z-10 relative">
-        <h1 className="text-3xl font-black tracking-tighter bg-clip-text text-transparent bg-gradient-to-r from-[var(--primary)] to-[var(--accent)] cursor-pointer" onClick={() => setScreen("Menu")}>
+      <header className="w-full px-4 py-3 md:px-6 flex justify-between items-center z-10 relative bg-black/30 backdrop-blur-sm border-b border-white/5">
+        <h1 className="text-2xl font-black tracking-tighter bg-clip-text text-transparent bg-gradient-to-r from-[var(--primary)] to-[var(--accent)] cursor-pointer" onClick={() => { playClick(); setScreen("Menu"); }}>
           PUZZIFY
         </h1>
-        <div className="flex gap-4">
-          <button onClick={() => setScreen("Store")} className="flex items-center gap-2 bg-white/10 hover:bg-white/20 px-4 py-2 rounded-full font-bold transition-all border border-white/5">
+        <div className="flex gap-3">
+          <button onClick={() => { playClick(); setScreen("Store"); }} className="flex items-center gap-2 bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-full font-bold transition-all border border-white/5">
             <span className="text-yellow-400">🪙 {profile.coins}</span>
-            <ShoppingCart size={18} />
+            <ShoppingCart size={16} />
           </button>
-          <button onClick={() => setScreen("Profile")} className="p-2 bg-white/10 hover:bg-white/20 rounded-full transition-all border border-white/5">
-            <User size={20} />
+          <button onClick={() => { playClick(); setScreen("Profile"); }} className="p-0 bg-white/10 hover:bg-white/20 rounded-full transition-all border border-white/5 overflow-hidden w-9 h-9 flex items-center justify-center">
+            {profile.photoDataUrl ? (
+              <img src={profile.photoDataUrl} alt="Profile" className="w-full h-full object-cover" />
+            ) : (
+              <User size={18} />
+            )}
           </button>
-          <button onClick={() => setScreen("Settings")} className="p-2 bg-white/10 hover:bg-white/20 rounded-full transition-all border border-white/5">
-            <Settings size={20} />
+          <button onClick={() => { playClick(); setScreen("Settings"); }} className="p-2 bg-white/10 hover:bg-white/20 rounded-full transition-all border border-white/5">
+            <Settings size={18} />
           </button>
         </div>
       </header>
 
       {/* Screen Content */}
-      <div className="flex-1 w-full max-w-7xl mx-auto p-4 flex flex-col items-center justify-center z-10 relative">
+      <div className="flex-1 w-full max-w-7xl mx-auto p-4 md:pl-28 pb-28 md:pb-8 flex flex-col items-center justify-center z-10 relative overflow-y-auto">
 
         {screen === "Menu" && (
-          <div className="flex flex-col items-center w-full max-w-md animate-in fade-in zoom-in duration-500">
-            <div className="mb-8 text-center">
-              <h2 className="text-5xl font-black mb-4">Ready to race?</h2>
-              <p className="text-white/60">Spatial cognitive training.</p>
+          <div className="flex flex-col items-center w-full max-w-lg animate-in fade-in zoom-in duration-500 py-4">
+            <div className="mb-6 text-center">
+              <h2 className="text-4xl md:text-5xl font-black mb-2">Ready to race?</h2>
+              <p className="text-white/60 text-sm">Spatial cognitive training.</p>
             </div>
 
-            <div className="w-full flex flex-col gap-6">
+            <div className="w-full flex flex-col gap-3">
 
-              <button onClick={() => setScreen("MultiplayerMenu")} className="w-full group relative overflow-hidden rounded-2xl bg-gradient-to-r from-[var(--accent)] to-rose-500 p-[2px] transition-transform hover:scale-105 active:scale-95 shadow-[0_0_30px_rgba(255,77,157,0.3)]">
-                <div className="flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm px-6 py-6 rounded-[14px]">
-                  <Users size={32} className="mb-2 text-white" />
-                  <span className="font-black text-2xl text-white tracking-widest">MULTIPLAYER HUB</span>
-                  <span className="text-white/70 text-sm mt-1">Race globally or play with friends</span>
+              <button onClick={() => { playClick(); setScreen("MultiplayerMenu"); }} className="w-full group relative overflow-hidden rounded-2xl bg-gradient-to-r from-[var(--accent)] to-rose-500 p-[2px] transition-transform hover:scale-[1.02] active:scale-95 shadow-[0_0_30px_rgba(255,77,157,0.3)]">
+                <div className="flex items-center justify-center gap-4 bg-black/60 backdrop-blur-sm px-6 py-5 rounded-[14px]">
+                  <Users size={28} className="text-white shrink-0" />
+                  <div className="text-left">
+                    <div className="font-black text-xl text-white tracking-widest font-display">MULTIPLAYER HUB</div>
+                    <div className="text-white/70 text-sm">Race globally or play with friends</div>
+                  </div>
                 </div>
               </button>
 
-              <div className="flex items-center gap-4 w-full">
-                <div className="h-px bg-white/10 flex-1"></div>
-                <span className="text-white/40 text-xs font-bold tracking-widest uppercase">Solo Practice</span>
-                <div className="h-px bg-white/10 flex-1"></div>
+              <div className="w-full bg-black/40 backdrop-blur-md border border-white/10 rounded-2xl p-4">
+                <div className="text-white/40 text-xs font-bold tracking-widest uppercase mb-3">Solo Practice</div>
+                <div className="grid grid-cols-3 gap-2">
+                  <button onClick={() => { playClick(); startSoloGame("Easy"); }} className="bg-white/10 hover:bg-white/20 py-3 rounded-xl font-bold transition-all border border-white/5">Easy</button>
+                  <button onClick={() => { playClick(); startSoloGame("Medium"); }} className="bg-white/10 hover:bg-white/20 py-3 rounded-xl font-bold transition-all border border-[var(--primary)]/50 shadow-[0_0_15px_rgba(108,43,217,0.3)]">Medium</button>
+                  <button onClick={() => { playClick(); startSoloGame("Hard"); }} className="bg-white/10 hover:bg-white/20 py-3 rounded-xl font-bold transition-all border border-white/5">Hard</button>
+                </div>
               </div>
 
-              <div className="grid grid-cols-3 gap-2">
-                <button onClick={() => startSoloGame("Easy")} className="bg-white/5 hover:bg-white/10 py-3 rounded-xl font-bold transition-all border border-white/5">Easy</button>
-                <button onClick={() => startSoloGame("Medium")} className="bg-white/5 hover:bg-white/10 py-3 rounded-xl font-bold transition-all border border-[var(--primary)]/50 shadow-[0_0_15px_rgba(108,43,217,0.3)]">Medium</button>
-                <button onClick={() => startSoloGame("Hard")} className="bg-white/5 hover:bg-white/10 py-3 rounded-xl font-bold transition-all border border-white/5">Hard</button>
-              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  onClick={() => { playClick(); setScreen("Rewards"); }}
+                  className="flex items-center justify-center gap-2 bg-black/40 backdrop-blur-md hover:bg-yellow-400/10 py-3 rounded-xl font-bold transition-all duration-300 border border-yellow-400/40 shadow-[0_0_12px_rgba(250,204,21,0.2)] hover:shadow-[0_0_20px_rgba(250,204,21,0.4)]"
+                >
+                  <Gift size={18} /> Daily Rewards
+                </button>
 
-              <button onClick={() => setScreen("Manual")} className="w-full mt-4 flex items-center justify-center gap-2 bg-white/5 hover:bg-white/10 py-3 rounded-xl font-bold transition-all border border-white/5">
-                <BookOpen size={20} /> How to Play
-              </button>
+                <button
+                  onClick={() => { playClick(); setScreen("Manual"); }}
+                  className="flex items-center justify-center gap-2 bg-black/40 backdrop-blur-md hover:bg-white/10 py-3 rounded-xl font-bold transition-all duration-300 border border-white/10 shadow-[0_0_12px_rgba(255,255,255,0.05)] hover:shadow-[0_0_18px_rgba(255,255,255,0.15)]"
+                >
+                  <BookOpen size={18} /> How to Play
+                </button>
+              </div>
 
             </div>
           </div>
         )}
 
         {screen === "MultiplayerMenu" && (
-          <div className="w-full max-w-lg glass-panel rounded-3xl p-8 animate-in fade-in zoom-in-95">
+          <div className="w-full max-w-4xl glass-panel rounded-3xl p-6 animate-in fade-in zoom-in-95 overflow-y-auto max-h-[calc(100vh-120px)]">
             <button onClick={() => setScreen("Menu")} className="mb-6 flex items-center gap-2 text-white/50 hover:text-white transition-colors font-bold">
               <ArrowLeft size={20} /> Back to Menu
             </button>
             <h2 className="text-3xl font-black mb-8 flex items-center gap-3"><Users /> Multiplayer Hub</h2>
 
-            <div className="space-y-8">
+            <div className="flex flex-col gap-5">
               {/* Quick Match Section */}
-              <div className="bg-white/5 border border-white/10 rounded-2xl p-5">
+              <div className="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-[0_20px_40px_rgba(0,0,0,0.35)]">
                 <h3 className="text-xl font-bold mb-4 flex items-center gap-2"><Globe size={18} className="text-blue-400" /> Public Matchmaking</h3>
                 <div className="flex flex-col gap-3">
                   <div className="flex justify-between items-center bg-black/30 p-3 rounded-xl border border-white/5">
                     <span className="text-sm font-bold text-white/70">Difficulty</span>
                     <select
-                      className="bg-transparent text-white font-black outline-none cursor-pointer"
+                      className="bg-black/50 text-white font-black outline-none cursor-pointer rounded-lg px-3 py-1 border border-white/20"
                       value={matchmakingDifficulty}
                       onChange={(e) => setMatchmakingDifficulty(e.target.value as any)}
                     >
@@ -540,7 +646,7 @@ export default function Home() {
               </div>
 
               {/* Private Rooms Section */}
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div className="bg-white/5 border border-white/10 rounded-2xl p-5 flex flex-col items-center justify-center text-center">
                   <DoorOpen size={32} className="text-[var(--accent)] mb-3" />
                   <h4 className="font-bold mb-2">Host Game</h4>
@@ -617,11 +723,17 @@ export default function Home() {
                   </div>
                   <div className={`flex items-center justify-between p-4 rounded-xl border ${mp.opponentJoined ? 'bg-white/5 border-green-500/50' : 'bg-transparent border-dashed border-white/20'}`}>
                     <div className="flex items-center gap-3">
-                      <div className={`w-10 h-10 rounded-full flex items-center justify-center font-black ${mp.opponentJoined ? 'bg-pink-500' : 'bg-white/10 text-white/30'}`}>
-                        {mp.opponentJoined ? 'P2' : '?'}
+                      <div className={`w-10 h-10 rounded-full overflow-hidden flex items-center justify-center font-black ${mp.opponentJoined ? 'bg-pink-500' : 'bg-white/10 text-white/30'}`}>
+                        {mp.opponentJoined ? (
+                          mp.opponentProfile?.photoDataUrl ? (
+                            <img src={mp.opponentProfile.photoDataUrl} alt="Opponent" className="w-full h-full object-cover" />
+                          ) : (
+                            mp.opponentProfile?.gamerName.substring(0, 2).toUpperCase() || 'P2'
+                          )
+                        ) : '?'}
                       </div>
                       <span className={`font-bold ${mp.opponentJoined ? 'text-white' : 'text-white/50'}`}>
-                        {mp.opponentJoined ? 'Player 2' : 'Waiting...'}
+                        {mp.opponentJoined ? (mp.opponentProfile?.gamerName || 'Player 2') : 'Waiting...'}
                       </span>
                     </div>
                     {mp.opponentJoined && <span className="text-xs bg-green-500 px-2 py-1 rounded font-bold uppercase">Ready</span>}
@@ -687,8 +799,8 @@ export default function Home() {
                             disabled={!mp.isHost}
                             onClick={() => mp.updateRoomSettings({ mode: mode.id, ...(mode.id === "solver_saboteur" ? { timeLimit: -1 } : {}) })}
                             className={`text-left rounded-lg p-3 border transition-all ${active
-                                ? "border-[var(--accent)] bg-[var(--accent)]/10"
-                                : "border-white/10 bg-black/20 hover:border-white/30"
+                              ? "border-[var(--accent)] bg-[var(--accent)]/10"
+                              : "border-white/10 bg-black/20 hover:border-white/30"
                               } disabled:opacity-60`}
                           >
                             <div className="font-bold text-sm">{mode.title}</div>
@@ -813,254 +925,208 @@ export default function Home() {
                 </button>
               </div>
             ) : (
-              <div className={`flex flex-col ${isMultiplayer ? 'xl:flex-row' : ''} gap-6 items-center justify-center w-full max-w-7xl flex-1 relative`}>
-                {isMultiplayer && mp.isLiveCaptureEnabled && (
-                  <>
-                    <div className="absolute top-2 left-2 z-40 w-28 h-20 sm:w-36 sm:h-24 bg-black/60 rounded-lg overflow-hidden border border-white/20">
-                      {localCameraEnabled ? (
-                        <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center text-[10px] text-white/60 px-2 text-center">Tap camera button</div>
-                      )}
-                      <div className="absolute bottom-0 left-0 right-0 bg-black/60 text-[9px] sm:text-[10px] text-white/80 px-1 py-0.5 text-center">You</div>
-                    </div>
-                    <div className="absolute top-2 right-2 z-40 w-28 h-20 sm:w-36 sm:h-24 bg-black/60 rounded-lg overflow-hidden border border-white/20">
-                      {mp.opponentFrameDataUrl ? (
-                        <img src={mp.opponentFrameDataUrl} alt="Opponent live" className="w-full h-full object-cover" />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center text-[10px] text-white/60 px-2 text-center">Waiting opponent cam</div>
-                      )}
-                      <div className="absolute bottom-0 left-0 right-0 bg-black/60 text-[9px] sm:text-[10px] text-white/80 px-1 py-0.5 text-center">Opponent</div>
-                    </div>
-                    <canvas ref={captureCanvasRef} className="hidden" />
-                  </>
-                )}
+              <div className="w-full max-w-[1500px] flex flex-col xl:flex-row items-center xl:items-start justify-center gap-6 flex-1 px-2 z-10">
+                {/* LEFT COLUMN: Camera & Opponent (Multiplayer Only) */}
+                {isMultiplayer && (
+                  <div className="w-full xl:w-72 shrink-0 flex flex-col gap-4 animate-slide-up" style={{ animationDelay: '0.1s' }}>
+                    {mp.isLiveCaptureEnabled && (
+                      <div className="glass-panel rounded-2xl p-4 flex flex-col gap-4 shadow-[0_0_30px_rgba(0,240,255,0.1)] neon-border">
+                        <div className="text-white/50 text-xs font-bold uppercase tracking-wider text-center w-full flex justify-between items-center">
+                          <span>Live Feeds</span>
+                          <Camera size={14} />
+                        </div>
+                        <div className="flex flex-row xl:flex-col gap-4 justify-center">
+                          <div className="relative w-32 h-24 xl:w-full xl:h-36 bg-black/80 rounded-xl overflow-hidden border border-[var(--primary)]/50">
+                            {localCameraEnabled ? (
+                              <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
+                            ) : (
+                              <div className="w-full h-full flex flex-col items-center justify-center text-[10px] text-white/60 px-2 text-center">
+                                <CameraOff size={16} className="mb-1" />
+                                Camera Off
+                              </div>
+                            )}
+                            <div className="absolute bottom-0 left-0 right-0 bg-black/60 text-[10px] text-white/80 px-1 py-1 text-center font-bold">You</div>
+                          </div>
+                          <div className="relative w-32 h-24 xl:w-full xl:h-36 bg-black/80 rounded-xl overflow-hidden border border-[var(--accent)]/50">
+                            {mp.opponentFrameDataUrl ? (
+                              <img src={mp.opponentFrameDataUrl} alt="Opponent live" className="w-full h-full object-cover" />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center text-[10px] text-white/60 px-2 text-center">Waiting feed...</div>
+                            )}
+                            <div className="absolute bottom-0 left-0 right-0 bg-black/60 text-[10px] text-white/80 px-1 py-1 text-center font-bold">Opponent</div>
+                          </div>
+                        </div>
+                        <canvas ref={captureCanvasRef} className="hidden" />
+                      </div>
+                    )}
 
-                {/* Pause Overlay */}
-                {isPaused && (
-                  <div className="absolute inset-0 z-50 bg-black/60 backdrop-blur-md rounded-3xl flex flex-col items-center justify-center border border-white/10 shadow-2xl">
-                    <h2 className="text-4xl font-black mb-8 tracking-widest uppercase">Paused</h2>
-                    <div className="flex flex-col gap-4 w-full max-w-xs">
-                      <button onClick={handleResume} className="w-full py-4 rounded-xl bg-gradient-to-r from-[var(--primary)] to-[var(--accent)] font-black text-lg hover:opacity-90 active:scale-95 transition-all shadow-[0_0_20px_rgba(255,77,157,0.4)]">
-                        RESUME
-                      </button>
-                      <button onClick={handleGameOverBack} className="w-full py-4 rounded-xl bg-white/10 hover:bg-white/20 font-black text-lg active:scale-95 transition-all border border-white/5">
-                        EXIT GAME
-                      </button>
+                    <div className="glass-panel rounded-2xl p-4 shadow-[0_0_30px_rgba(255,77,157,0.1)] flex flex-col relative overflow-hidden border border-[var(--accent)]/30">
+                      <div className="text-[var(--accent)] text-xs font-bold uppercase tracking-wider mb-3 flex items-center justify-between">
+                        <span className="flex items-center gap-2 font-display"><Zap size={14} /> {mp.opponentProfile?.gamerName || 'Opponent'}</span>
+                        <span className="font-display">{mp.opponentProgress}%</span>
+                      </div>
+                      <div className="text-[11px] text-white/60 mb-2">{mp.opponentStatus}</div>
+                      <OpponentBoard cols={game.getGridConfig().cols} size={game.getGridConfig().size} imageUrl={game.imageUrl} matchedIndices={mp.opponentMatchedIndices} />
+                      <div className="mt-3 w-full bg-white/10 h-2 rounded-full overflow-hidden shadow-inner relative">
+                        <div className="h-full bg-gradient-to-r from-[var(--accent)] to-rose-400 transition-all duration-500 ease-out" style={{ width: `${mp.opponentProgress}%` }} />
+                      </div>
                     </div>
                   </div>
                 )}
 
-                {/* Main Player Area */}
-                <div className={`flex-1 w-full max-w-2xl flex flex-col relative ${interferenceClass}`}>
+                {/* CENTER COLUMN: Main Game Area */}
+                <div className={`flex-1 w-full max-w-2xl flex flex-col relative animate-slide-up ${interferenceClass}`}>
+                  {/* Pause Overlay */}
+                  {isPaused && (
+                    <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md rounded-3xl flex flex-col items-center justify-center border border-[var(--primary)]/30 shadow-[0_0_50px_rgba(0,240,255,0.2)]">
+                      <h2 className="text-5xl font-black mb-8 tracking-widest uppercase font-display bg-clip-text text-transparent bg-gradient-to-r from-[var(--primary)] to-[var(--accent)]">Paused</h2>
+                      <div className="flex flex-col gap-4 w-full max-w-xs">
+                        <button onClick={() => { playClick(); handleResume(); }} className="w-full py-4 rounded-xl bg-gradient-to-r from-[var(--primary)] to-[var(--accent)] font-black text-lg hover:opacity-90 active:scale-95 transition-all shadow-[0_0_20px_rgba(0,240,255,0.4)]">
+                          RESUME
+                        </button>
+                        <button onClick={() => { playClick(); handleGameOverBack(); }} className="w-full py-4 rounded-xl bg-white/10 hover:bg-white/20 font-black text-lg active:scale-95 transition-all border border-white/10">
+                          EXIT GAME
+                        </button>
+                      </div>
+                    </div>
+                  )}
 
                   <div className="w-full flex justify-between mb-2">
                     <div className="flex gap-2">
-                      <button
-                        onClick={game.useHint}
-                        disabled={!canSolve}
-                        className="p-2 bg-white/10 hover:bg-white/20 rounded-full transition-all flex items-center gap-2 text-sm font-bold border border-white/5 disabled:opacity-50"
-                      >
+                      <button onClick={() => { playClick(); game.useHint(); }} disabled={!canSolve} className="p-2 glass-panel hover:bg-white/20 rounded-full transition-all flex items-center gap-2 text-sm font-bold disabled:opacity-50">
                         <Lightbulb size={16} className="text-yellow-400" /> Smart Hint
                       </button>
                       {isMultiplayer && mp.isLiveCaptureEnabled && (
-                        <button
-                          onClick={localCameraEnabled ? stopCamera : startCamera}
-                          className="p-2 bg-white/10 hover:bg-white/20 rounded-full transition-all flex items-center gap-2 text-sm font-bold border border-white/5"
-                        >
-                          {localCameraEnabled ? <CameraOff size={16} /> : <Camera size={16} />}
-                          {localCameraEnabled ? "Camera Off" : "Camera On"}
+                        <button onClick={() => { playClick(); localCameraEnabled ? stopCamera() : startCamera(); }} className="p-2 glass-panel hover:bg-white/20 rounded-full transition-all flex items-center gap-2 text-sm font-bold">
+                          {localCameraEnabled ? <CameraOff size={16} className="text-red-400" /> : <Camera size={16} className="text-[var(--primary)]" />}
                         </button>
                       )}
                     </div>
-                    <button onClick={handlePause} className="p-2 bg-white/10 hover:bg-white/20 rounded-full transition-all flex items-center gap-2 text-sm font-bold border border-white/5">
+                    <button onClick={() => { playClick(); handlePause(); }} className="p-2 glass-panel hover:bg-white/20 rounded-full transition-all flex items-center gap-2 text-sm font-bold">
                       <Pause size={16} /> Pause
                     </button>
                   </div>
-                  {isMultiplayer && mp.isLiveCaptureEnabled && !cameraError && (
-                    <div className="text-xs text-white/60 mb-2">
-                      {localCameraEnabled ? "Live camera on" : "Enable camera to stream live"}
-                    </div>
-                  )}
-                  {cameraError && <div className="text-xs text-red-300 mb-2">{cameraError}</div>}
+                  {cameraError && <div className="text-xs text-red-300 mb-2 bg-red-900/50 p-2 rounded-lg border border-red-500">{cameraError}</div>}
 
                   {isMultiplayer && mp.activeInterference && (
-                    <div className="absolute -top-10 left-1/2 -translate-x-1/2 bg-red-500 text-white font-black px-4 py-1 rounded-full animate-bounce z-50 flex items-center shadow-[0_0_20px_rgba(239,68,68,0.8)]">
-                      <ShieldAlert size={16} className="mr-2" /> INTERFERENCE INCOMING
+                    <div className="absolute -top-10 left-1/2 -translate-x-1/2 bg-red-500 text-white font-black px-4 py-1 rounded-full animate-bounce z-50 flex items-center shadow-[0_0_20px_rgba(239,68,68,0.8)] font-display">
+                      <ShieldAlert size={16} className="mr-2" /> WARNING: INTERFERENCE
                     </div>
                   )}
 
-                  <HUD
-                    score={game.score}
-                    moves={game.moves}
-                    timer={game.timer}
-                    timeLimit={game.timeLimit}
-                    combo={game.combo}
-                    accuracy={accuracy}
-                  />
-
-                  {/* Powerups Area */}
-                  {canSolve && (
-                    <div className="flex gap-4 justify-center mb-4 relative z-10">
-                      <button 
-                        onClick={() => { setActiveShield(true); setPowerupCooldown(Date.now() + 15000); }} 
-                        disabled={currentMillis < powerupCooldown || activeShield}
-                        className={`p-3 rounded-full border transition-all ${activeShield ? 'bg-blue-500/50 border-blue-300 shadow-[0_0_15px_rgba(59,130,246,0.6)]' : 'bg-white/10 hover:bg-white/20 border-white/20'} disabled:opacity-50 relative group`}
-                      >
-                        <Shield size={24} className={activeShield ? 'text-blue-200' : 'text-blue-400'} />
-                        <span className="absolute -top-8 left-1/2 -translate-x-1/2 bg-black/80 text-[10px] uppercase font-bold px-2 py-1 rounded opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity">Shield</span>
-                      </button>
-                      <button 
-                        onClick={() => { mp.sendPowerupAction({ actionType: "freeze", payload: { durationMs: 4000 } }); setPowerupCooldown(Date.now() + 15000); }} 
-                        disabled={currentMillis < powerupCooldown || !isMultiplayer}
-                        className="p-3 rounded-full border bg-white/10 hover:bg-white/20 border-white/20 transition-all disabled:opacity-50 relative group"
-                      >
-                        <Snowflake size={24} className="text-cyan-400" />
-                        <span className="absolute -top-8 left-1/2 -translate-x-1/2 bg-black/80 text-[10px] uppercase font-bold px-2 py-1 rounded opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity">Freeze</span>
-                      </button>
-                      <button 
-                        onClick={() => { game.autoMatch(); setPowerupCooldown(Date.now() + 15000); }} 
-                        disabled={currentMillis < powerupCooldown}
-                        className="p-3 rounded-full border bg-white/10 hover:bg-white/20 border-white/20 transition-all disabled:opacity-50 relative group"
-                      >
-                        <Wand2 size={24} className="text-fuchsia-400" />
-                        <span className="absolute -top-8 left-1/2 -translate-x-1/2 bg-black/80 text-[10px] uppercase font-bold px-2 py-1 rounded opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity">Auto-Match</span>
-                      </button>
-                    </div>
-                  )}
-
-                  {isMultiplayer && mp.activeMode === "solver_saboteur" && (
-                    <div className="mb-3 space-y-2">
-                      <div className="text-xs font-bold uppercase tracking-widest text-center text-white/70">
-                        Role: <span className={mp.myRole === "solver" ? "text-emerald-300" : "text-red-300"}>{mp.myRole}</span>
-                      </div>
-                      {mp.myRole === "saboteur" && (
-                        <div className="flex flex-wrap gap-2 justify-center">
-                          <button
-                            onClick={() => setSelectedSabotageAction((prev) => prev === "lock_tile" ? null : "lock_tile")}
-                            disabled={currentMillis < sabotageCooldownUntil}
-                            className={`px-3 py-1 rounded-full text-xs font-bold border ${selectedSabotageAction === "lock_tile" ? "bg-red-500/30 border-red-400" : "bg-white/10 border-white/20"} disabled:opacity-50`}
-                          >
-                            Lock (3 moves)
-                          </button>
-                          <button
-                            onClick={() => setSelectedSabotageAction((prev) => prev === "fake_highlight" ? null : "fake_highlight")}
-                            disabled={currentMillis < sabotageCooldownUntil}
-                            className={`px-3 py-1 rounded-full text-xs font-bold border ${selectedSabotageAction === "fake_highlight" ? "bg-yellow-500/30 border-yellow-300" : "bg-white/10 border-white/20"} disabled:opacity-50`}
-                          >
-                            Fake Highlight
-                          </button>
-                          <button
-                            onClick={() => triggerSabotage("invert_controls")}
-                            disabled={currentMillis < sabotageCooldownUntil}
-                            className="px-3 py-1 rounded-full text-xs font-bold border bg-purple-500/20 border-purple-300 disabled:opacity-50"
-                          >
-                            Rotate + Interference
-                          </button>
-                        </div>
-                      )}
-                      {mp.myRole === "saboteur" && (
-                        <div className="text-[11px] text-center text-white/60">
-                          {selectedSabotageAction ? "Click a tile on solver grid to cast." : (currentMillis < sabotageCooldownUntil ? "Cooldown active..." : "Choose an ability.")}
-                        </div>
-                      )}
-                    </div>
-                  )}
+                  <HUD score={game.score} moves={game.moves} timer={game.timer} timeLimit={game.timeLimit} combo={game.combo} accuracy={accuracy} />
 
                   {/* Focus Meter */}
                   <div className="w-full glass-panel h-4 rounded-full mb-4 overflow-hidden relative border border-white/20">
-                    <div
-                      className={`h-full transition-all duration-300 ${game.isCalmMode ? 'bg-blue-400 shadow-[0_0_15px_rgba(96,165,250,0.8)]' : 'bg-gradient-to-r from-[var(--primary)] to-[var(--accent)]'}`}
-                      style={{ width: `${game.focusMeter}%` }}
-                    />
+                    <div className={`h-full transition-all duration-300 ${game.isCalmMode ? 'bg-blue-400 shadow-[0_0_15px_rgba(96,165,250,0.8)]' : 'bg-gradient-to-r from-[var(--primary)] to-[var(--accent)]'}`} style={{ width: `${game.focusMeter}%` }} />
                     {game.isCalmMode && <div className="absolute inset-0 flex items-center justify-center text-[10px] font-black tracking-widest uppercase drop-shadow-md">Calm Mode Active</div>}
                   </div>
 
                   <div className={`w-full aspect-square relative flex items-center justify-center transition-transform duration-300 ${isInverted ? "rotate-90" : ""}`}>
-                    <GameBoard
-                      tiles={boardTiles}
-                      onTileClick={handleBoardTileClick}
-                      colorBlindMode={profile.colorBlindMode}
-                      imageUrl={game.imageUrl}
-                      gridConfig={game.getGridConfig()}
-                      selectedId={mp.myRole === "saboteur" ? null : game.selectedId}
-                    />
-                    {isMultiplayer && mp.activeMode === "fog" && (
-                      <div className="absolute inset-0 rounded-2xl pointer-events-none" style={fogMaskStyle} />
-                    )}
+                    <GameBoard tiles={boardTiles} onTileClick={handleBoardTileClick} colorBlindMode={profile.colorBlindMode} imageUrl={game.imageUrl} gridConfig={game.getGridConfig()} selectedId={mp.myRole === "saboteur" ? null : game.selectedId} />
+                    {isMultiplayer && mp.activeMode === "fog" && <div className="absolute inset-0 rounded-2xl pointer-events-none" style={fogMaskStyle} />}
                     {(fakeHighlightIds.length > 0 || lockedTileId) && (
                       <div className={`absolute inset-2 grid gap-1 sm:gap-2 ${game.getGridConfig().cols === 4 ? "grid-cols-4" : game.getGridConfig().cols === 6 ? "grid-cols-6" : "grid-cols-8"} pointer-events-none`}>
                         {boardTiles.map((tile) => (
-                          <div
-                            key={`fx-${tile.id}`}
-                            className={`rounded-xl ${fakeHighlightIds.includes(tile.id) ? "ring-2 ring-yellow-300/70 bg-yellow-300/15 animate-pulse" : ""
-                              } ${lockedTileId === tile.id ? "ring-2 ring-red-500/80 bg-red-500/20" : ""}`}
-                          />
+                          <div key={`fx-${tile.id}`} className={`rounded-xl ${fakeHighlightIds.includes(tile.id) ? "ring-2 ring-yellow-300/70 bg-yellow-300/15 animate-pulse" : ""} ${lockedTileId === tile.id ? "ring-2 ring-red-500/80 bg-red-500/20" : ""}`} />
                         ))}
                       </div>
                     )}
                     {isFrozen && (
-                      <div className="absolute inset-0 bg-cyan-900/40 backdrop-blur-sm rounded-2xl flex items-center justify-center border border-cyan-400 pointer-events-none z-20 shadow-[0_0_30px_rgba(34,211,238,0.3)]">
+                      <div className="absolute inset-0 bg-cyan-900/60 backdrop-blur-sm rounded-2xl flex items-center justify-center border-2 border-cyan-400 pointer-events-none z-20 shadow-[0_0_50px_rgba(34,211,238,0.4)]">
                         <div className="flex flex-col items-center animate-pulse">
-                          <Snowflake size={48} className="text-cyan-300 mb-2 drop-shadow-lg" />
-                          <span className="text-cyan-100 font-black text-xl tracking-widest uppercase">Frozen</span>
+                          <Snowflake size={64} className="text-cyan-300 mb-4 drop-shadow-lg" />
+                          <span className="text-cyan-100 font-black text-3xl tracking-widest uppercase font-display">Frozen</span>
                         </div>
                       </div>
                     )}
                   </div>
                   {isMultiplayer && mp.activeMode === "solver_saboteur" && lockedTileMovesRemaining > 0 && (
-                    <div className="mt-2 text-xs text-center text-red-300 font-bold">
-                      Locked tile active: {lockedTileMovesRemaining} move(s) left
-                    </div>
+                    <div className="mt-2 text-xs text-center text-red-300 font-bold">Locked tile active: {lockedTileMovesRemaining} move(s) left</div>
                   )}
                 </div>
 
-                {/* Split Screen / Sidebar Area */}
-                <div className={`w-full ${isMultiplayer ? 'xl:w-80' : 'xl:w-64'} shrink-0 flex flex-col sm:flex-row xl:flex-col gap-4 mt-4 xl:mt-0`}>
+                {/* RIGHT COLUMN: Tools & Target */}
+                <div className="w-full xl:w-72 shrink-0 flex flex-col gap-4 animate-slide-up" style={{ animationDelay: '0.2s' }}>
+
+                  {/* Powerups Area */}
+                  {canSolve && (
+                    <div className="glass-panel rounded-2xl p-4 shadow-[0_0_30px_rgba(0,240,255,0.1)] neon-border">
+                      <div className="text-white/50 text-xs font-bold uppercase tracking-wider mb-3 text-center w-full">Powerups</div>
+                      <div className="flex gap-4 justify-center relative z-10">
+                        <button onClick={() => {
+                          if (!usePowerup("shield")) return;
+                          playClick();
+                          playPowerup("shield");
+                          setActiveShield(true);
+                          setPowerupCooldown(Date.now() + 15000);
+                        }} disabled={currentMillis < powerupCooldown || activeShield || profile.inventory.shield <= 0} className={`p-3 rounded-xl border transition-all ${activeShield ? 'bg-blue-500/50 border-blue-300 shadow-[0_0_15px_rgba(59,130,246,0.6)]' : 'bg-white/10 hover:bg-white/20 border-white/20'} disabled:opacity-50 relative group`}>
+                          <Shield size={24} className={activeShield ? 'text-blue-200' : 'text-blue-400'} />
+                          <span className="absolute -top-2 -right-2 text-[10px] rounded-full bg-black/80 px-1.5 py-0.5 border border-white/20">{profile.inventory.shield}</span>
+                        </button>
+                        <button onClick={() => {
+                          if (!usePowerup("freeze")) return;
+                          playClick();
+                          playPowerup("freeze");
+                          mp.sendPowerupAction({ actionType: "freeze", payload: { durationMs: 4000 } });
+                          setPowerupCooldown(Date.now() + 15000);
+                        }} disabled={currentMillis < powerupCooldown || !isMultiplayer || profile.inventory.freeze <= 0} className="p-3 rounded-xl border bg-white/10 hover:bg-white/20 border-white/20 transition-all disabled:opacity-50 relative group">
+                          <Snowflake size={24} className="text-cyan-400" />
+                          <span className="absolute -top-2 -right-2 text-[10px] rounded-full bg-black/80 px-1.5 py-0.5 border border-white/20">{profile.inventory.freeze}</span>
+                        </button>
+                        <button onClick={() => {
+                          if (!usePowerup("autoMatch")) return;
+                          playClick();
+                          playPowerup("auto");
+                          game.autoMatch();
+                          setPowerupCooldown(Date.now() + 15000);
+                        }} disabled={currentMillis < powerupCooldown || profile.inventory.autoMatch <= 0} className="p-3 rounded-xl border bg-white/10 hover:bg-white/20 border-white/20 transition-all disabled:opacity-50 relative group">
+                          <Wand2 size={24} className="text-fuchsia-400" />
+                          <span className="absolute -top-2 -right-2 text-[10px] rounded-full bg-black/80 px-1.5 py-0.5 border border-white/20">{profile.inventory.autoMatch}</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {isMultiplayer && mp.activeMode === "solver_saboteur" && (
+                    <div className="glass-panel rounded-2xl p-4 shadow-2xl neon-border">
+                      <div className="text-xs font-bold uppercase tracking-widest text-center text-white/70 mb-3">
+                        Role: <span className={mp.myRole === "solver" ? "text-[var(--primary)]" : "text-[var(--accent)]"}>{mp.myRole}</span>
+                      </div>
+                      {mp.myRole === "saboteur" && (
+                        <div className="flex flex-col gap-2">
+                          <button onClick={() => { playClick(); setSelectedSabotageAction((prev) => prev === "lock_tile" ? null : "lock_tile"); }} disabled={currentMillis < sabotageCooldownUntil} className={`p-2 rounded-xl text-xs font-bold border ${selectedSabotageAction === "lock_tile" ? "bg-red-500/30 border-red-400" : "bg-white/10 border-white/20"} disabled:opacity-50 transition-all`}>
+                            Lock (3 moves)
+                          </button>
+                          <button onClick={() => { playClick(); setSelectedSabotageAction((prev) => prev === "fake_highlight" ? null : "fake_highlight"); }} disabled={currentMillis < sabotageCooldownUntil} className={`p-2 rounded-xl text-xs font-bold border ${selectedSabotageAction === "fake_highlight" ? "bg-yellow-500/30 border-yellow-300" : "bg-white/10 border-white/20"} disabled:opacity-50 transition-all`}>
+                            Fake Highlight
+                          </button>
+                          <button onClick={() => { playClick(); triggerSabotage("invert_controls"); }} disabled={currentMillis < sabotageCooldownUntil} className="p-2 rounded-xl text-xs font-bold border bg-purple-500/20 border-purple-300 disabled:opacity-50 transition-all">
+                            Rotate + Glitch
+                          </button>
+                          <div className="text-[10px] text-center text-white/60 mt-1">
+                            {selectedSabotageAction ? "Target a tile..." : (currentMillis < sabotageCooldownUntil ? "Cooldown..." : "Select ability.")}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {/* Target Image Preview */}
-                  <div className="flex-1 glass-panel rounded-2xl p-4 shadow-2xl flex flex-col items-center relative overflow-hidden group">
+                  <div className="glass-panel rounded-2xl p-4 shadow-2xl flex flex-col items-center relative overflow-hidden group border border-white/20">
                     <div className="text-white/50 text-xs font-bold uppercase tracking-wider mb-3 text-center w-full flex justify-between items-center z-10">
                       <span>Target Image</span>
                       <Target size={14} />
                     </div>
                     <div className="w-full aspect-square rounded-xl overflow-hidden shadow-inner border border-white/20 relative">
-                      {/* Explicit Grid overlay */}
                       <div className={`absolute inset-0 z-10 pointer-events-none grid gap-0.5 ${game.getGridConfig().cols === 4 ? "grid-cols-4" : game.getGridConfig().cols === 6 ? "grid-cols-6" : "grid-cols-8"}`}>
                         {Array.from({ length: game.getGridConfig().size }).map((_, i) => (
                           <div key={i} className="border border-white/30 w-full h-full rounded-sm"></div>
                         ))}
                       </div>
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img src={game.imageUrl} alt="Target reference" className="w-full h-full object-cover pointer-events-none" />
                     </div>
                   </div>
-
-                  {/* Opponent Split View (Multiplayer Only) */}
-                  {isMultiplayer && (
-                    <div className="flex-1 bg-black/60 border border-[var(--accent)]/30 rounded-2xl p-4 backdrop-blur-xl shadow-[0_0_30px_rgba(255,77,157,0.1)] flex flex-col relative overflow-hidden">
-                      <div className="text-[var(--accent)] text-xs font-bold uppercase tracking-wider mb-3 flex items-center justify-between">
-                        <span className="flex items-center gap-2"><Zap size={14} /> Opponent</span>
-                        <span>{mp.opponentProgress}%</span>
-                      </div>
-                      <div className="text-[11px] text-white/60 mb-2">{mp.opponentStatus}</div>
-
-                      {/* Opponent Mini Board replacing the progress bar */}
-                      <OpponentBoard
-                        cols={game.getGridConfig().cols}
-                        size={game.getGridConfig().size}
-                        imageUrl={game.imageUrl}
-                        matchedIndices={mp.opponentMatchedIndices}
-                      />
-
-                      <div className="mt-3 w-full bg-white/10 h-2 rounded-full overflow-hidden shadow-inner relative">
-                        <div
-                          className="h-full bg-gradient-to-r from-[var(--accent)] to-rose-400 transition-all duration-500 ease-out"
-                          style={{ width: `${mp.opponentProgress}%` }}
-                        />
-                      </div>
-                    </div>
-                  )}
 
                 </div>
 
@@ -1069,8 +1135,96 @@ export default function Home() {
           </div>
         )}
 
+        {screen === "Rewards" && (
+          <div className="w-full max-w-3xl glass-panel rounded-3xl p-6 animate-in fade-in zoom-in-95 overflow-y-auto max-h-[calc(100vh-120px)]">
+            <h2 className="text-3xl font-black mb-1 flex items-center gap-3"><Gift /> Daily Rewards</h2>
+            <p className="text-white/50 text-sm mb-6">Spin once every 24 hours to earn coins or powerups.</p>
+
+            <div className="flex flex-col md:flex-row gap-8 items-center justify-center">
+
+              {/* Wheel */}
+              <div className="flex flex-col items-center gap-5">
+                <SpinWheel
+                  segments={WHEEL_SEGMENTS}
+                  targetRotation={spinVisualRotation}
+                  isSpinning={isSpinning}
+                  size={320}
+                />
+                <button
+                  onClick={handleDailySpin}
+                  disabled={!canSpinNow || isSpinning}
+                  className="px-10 py-4 rounded-2xl bg-gradient-to-r from-[var(--primary)] to-[var(--accent)] font-black text-lg tracking-widest uppercase disabled:opacity-40 hover:opacity-90 active:scale-95 transition-all shadow-[0_0_25px_rgba(0,240,255,0.4)] disabled:shadow-none"
+                >
+                  {isSpinning ? "Spinning..." : canSpinNow ? "SPIN!" : "LOCKED"}
+                </button>
+              </div>
+
+              {/* Right panel */}
+              <div className="flex flex-col gap-4 w-full md:w-64">
+
+                {/* Countdown / ready */}
+                <div className="bg-white/5 rounded-2xl border border-white/10 p-4 text-center">
+                  {canSpinNow ? (
+                    <>
+                      <div className="text-4xl mb-1">🎡</div>
+                      <div className="font-black text-[var(--primary)] text-lg">Ready to Spin!</div>
+                      <div className="text-white/50 text-xs mt-1">Your daily spin awaits</div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="text-4xl mb-1">⏳</div>
+                      <div className="font-bold text-white/70 text-sm">Next spin in</div>
+                      <div className="font-black text-[var(--accent)] text-xl mt-1 tabular-nums">{formatCooldown(spinRemainingMs)}</div>
+                    </>
+                  )}
+                </div>
+
+                {/* Win result */}
+                {spinResult && (
+                  <div className="bg-emerald-500/15 border border-emerald-400/40 rounded-2xl p-4 font-bold text-emerald-300 text-center animate-in fade-in zoom-in-95">
+                    <div className="text-2xl mb-1">🏆</div>
+                    {spinResult}
+                  </div>
+                )}
+
+                {/* Possible rewards legend */}
+                <div className="bg-white/5 rounded-2xl border border-white/10 p-4">
+                  <h4 className="font-bold text-xs uppercase tracking-widest text-white/50 mb-3">Possible Prizes</h4>
+                  <div className="space-y-2">
+                    {WHEEL_SEGMENTS.slice(0, 5).map((seg, i) => (
+                      <div key={i} className="flex items-center gap-3">
+                        <div className="w-3 h-3 rounded-full shrink-0" style={{ background: seg.color }} />
+                        <span className="text-sm text-white/80">{seg.emoji} {seg.label} {seg.subLabel}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Inventory */}
+                <div className="bg-white/5 rounded-2xl border border-white/10 p-4">
+                  <h4 className="font-bold text-xs uppercase tracking-widest text-white/50 mb-3">Your Inventory</h4>
+                  <div className="grid grid-cols-3 gap-2 text-center text-sm">
+                    <div className="bg-white/5 rounded-xl p-2">
+                      <Shield className="mx-auto mb-1 text-blue-300" size={16} />
+                      <div className="font-black">{profile.inventory.shield}</div>
+                    </div>
+                    <div className="bg-white/5 rounded-xl p-2">
+                      <Snowflake className="mx-auto mb-1 text-cyan-300" size={16} />
+                      <div className="font-black">{profile.inventory.freeze}</div>
+                    </div>
+                    <div className="bg-white/5 rounded-xl p-2">
+                      <Wand2 className="mx-auto mb-1 text-fuchsia-300" size={16} />
+                      <div className="font-black">{profile.inventory.autoMatch}</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {screen === "Manual" && (
-          <div className="w-full max-w-2xl glass-panel rounded-3xl p-8 animate-in fade-in zoom-in-95 overflow-y-auto max-h-[80vh]">
+          <div className="w-full max-w-2xl glass-panel rounded-3xl p-6 animate-in fade-in zoom-in-95 overflow-y-auto max-h-[calc(100vh-120px)]">
             <button onClick={() => setScreen("Menu")} className="mb-6 flex items-center gap-2 text-white/50 hover:text-white transition-colors font-bold">
               <ArrowLeft size={20} /> Back to Menu
             </button>
@@ -1101,7 +1255,7 @@ export default function Home() {
         )}
 
         {screen === "Profile" && (
-          <div className="w-full max-w-md sm:max-w-lg glass-panel rounded-3xl p-5 sm:p-8 animate-in fade-in zoom-in-95">
+          <div className="w-full max-w-md sm:max-w-lg glass-panel rounded-3xl p-5 sm:p-8 animate-in fade-in zoom-in-95 overflow-y-auto max-h-[calc(100vh-120px)]">
             <button onClick={() => setScreen("Menu")} className="mb-6 flex items-center gap-2 text-white/50 hover:text-white transition-colors font-bold">
               <ArrowLeft size={20} /> Back to Menu
             </button>
@@ -1173,6 +1327,24 @@ export default function Home() {
                 </div>
                 <div className="flex justify-between items-center bg-white/5 p-3 rounded-lg border border-white/5">
                   <span>Hard</span><span className="font-bold font-mono text-[var(--accent)]">{profile.bestScoreHard}</span>
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                <h4 className="text-sm font-bold text-white/50 uppercase tracking-widest mt-6 mb-2">Powerup Inventory</h4>
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="bg-white/5 rounded-xl p-3 border border-white/5 text-center">
+                    <Shield className="mx-auto mb-1 text-blue-300" size={18} />
+                    <div className="text-xl font-black">{profile.inventory.shield}</div>
+                  </div>
+                  <div className="bg-white/5 rounded-xl p-3 border border-white/5 text-center">
+                    <Snowflake className="mx-auto mb-1 text-cyan-300" size={18} />
+                    <div className="text-xl font-black">{profile.inventory.freeze}</div>
+                  </div>
+                  <div className="bg-white/5 rounded-xl p-3 border border-white/5 text-center">
+                    <Wand2 className="mx-auto mb-1 text-fuchsia-300" size={18} />
+                    <div className="text-xl font-black">{profile.inventory.autoMatch}</div>
+                  </div>
                 </div>
               </div>
 
@@ -1255,20 +1427,20 @@ export default function Home() {
         )}
 
         {screen === "Store" && (
-          <div className="w-full max-w-4xl animate-in fade-in zoom-in-95">
-            <div className="flex justify-between items-center mb-8">
+          <div className="w-full max-w-4xl animate-in fade-in zoom-in-95 overflow-y-auto max-h-[calc(100vh-120px)]">
+            <div className="flex justify-between items-center mb-6">
               <button onClick={() => setScreen("Menu")} className="flex items-center gap-2 text-white/50 hover:text-white transition-colors font-bold">
                 <ArrowLeft size={20} /> Back to Menu
               </button>
               <h2 className="text-3xl font-black text-center flex items-center gap-3">
                 <ShoppingCart /> Item Shop
               </h2>
-              <div className="w-24"></div> {/* Spacer for centering */}
+              <div className="w-24"></div>
             </div>
 
-            <div className="grid md:grid-cols-3 gap-6">
+            <div className="grid md:grid-cols-3 gap-5">
               {/* Premium Box */}
-              <div className="bg-gradient-to-b from-purple-900/50 to-black/50 border border-[var(--primary)] rounded-3xl p-6 relative overflow-hidden group shadow-[0_0_30px_rgba(108,43,217,0.3)]">
+              <div className="bg-black/70 border border-[var(--primary)] rounded-3xl p-6 relative overflow-hidden group shadow-[0_0_30px_rgba(108,43,217,0.3)]">
                 <div className="absolute top-0 right-0 bg-[var(--primary)] text-xs font-bold px-3 py-1 rounded-bl-xl">POPULAR</div>
                 <Crown size={48} className="text-yellow-400 mb-4 drop-shadow-[0_0_15px_rgba(250,204,21,0.5)] group-hover:scale-110 transition-transform" />
                 <h3 className="text-2xl font-black mb-2">Premium Pass</h3>
@@ -1278,23 +1450,40 @@ export default function Home() {
                 </button>
               </div>
 
-              {/* Hints Pack */}
-              <div className="glass-panel rounded-3xl p-6">
-                <Lightbulb size={48} className="text-pink-400 mb-4" />
-                <h3 className="text-2xl font-black mb-2">10x Hints</h3>
-                <p className="text-white/60 text-sm mb-6 min-h-[60px]">Stuck on Hard mode? Get 10 extra hints to reveal the board instantly.</p>
-                <button className="w-full py-3 rounded-xl bg-white/10 hover:bg-white/20 font-bold flex items-center justify-center gap-2 transition-colors border border-white/5">
-                  <span className="text-yellow-400">🪙 500</span> Buy
+              {/* Shield Pack */}
+              <div className="bg-black/70 border border-white/20 rounded-3xl p-6">
+                <Shield size={48} className="text-blue-400 mb-4" />
+                <h3 className="text-2xl font-black mb-2">Shield x3</h3>
+                <p className="text-white/60 text-sm mb-6 min-h-[60px]">Absorb incoming multiplayer interference.</p>
+                <button
+                  onClick={() => {
+                    if (profile.coins < 150) return;
+                    playClick();
+                    addCoins(-150);
+                    addPowerup("shield", 3);
+                  }}
+                  className="w-full py-3 rounded-xl bg-white/10 hover:bg-white/20 font-bold flex items-center justify-center gap-2 transition-colors border border-white/10"
+                >
+                  <span className="text-yellow-400">🪙 150</span> Buy
                 </button>
               </div>
 
-              {/* Ad Reward */}
-              <div className="glass-panel rounded-3xl p-6">
-                <Star size={48} className="text-blue-400 mb-4" />
-                <h3 className="text-2xl font-black mb-2">Free Coins</h3>
-                <p className="text-white/60 text-sm mb-6 min-h-[60px]">Watch a short ad to earn 100 free coins instantly.</p>
-                <button className="w-full py-3 rounded-xl bg-white/10 hover:bg-white/20 font-bold flex items-center justify-center transition-colors border border-white/5">
-                  ▶ Watch Ad
+              {/* Freeze + Auto Pack */}
+              <div className="bg-black/70 border border-white/20 rounded-3xl p-6">
+                <Snowflake size={48} className="text-cyan-400 mb-4" />
+                <h3 className="text-2xl font-black mb-2">Control Pack</h3>
+                <p className="text-white/60 text-sm mb-6 min-h-[60px]">Get Freeze x2 and Auto-Match x1.</p>
+                <button
+                  onClick={() => {
+                    if (profile.coins < 220) return;
+                    playClick();
+                    addCoins(-220);
+                    addPowerup("freeze", 2);
+                    addPowerup("autoMatch", 1);
+                  }}
+                  className="w-full py-3 rounded-xl bg-white/10 hover:bg-white/20 font-bold flex items-center justify-center gap-2 transition-colors border border-white/10"
+                >
+                  <span className="text-yellow-400">🪙 220</span> Buy
                 </button>
               </div>
             </div>

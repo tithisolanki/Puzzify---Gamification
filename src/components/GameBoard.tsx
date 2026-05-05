@@ -23,7 +23,7 @@ export function GameBoard({ tiles, onTileClick, colorBlindMode, imageUrl, gridCo
   const rows = gridConfig.size / gridConfig.cols;
 
   return (
-    <div className="w-full h-full p-2 bg-white/5 backdrop-blur-sm rounded-2xl shadow-2xl border border-white/10 flex flex-col items-center">
+    <div className="w-full h-full p-2 bg-black/35 backdrop-blur-sm rounded-2xl shadow-[0_25px_60px_rgba(0,0,0,0.45)] border border-cyan-200/20 flex flex-col items-center">
       <div className={`w-full aspect-square grid gap-1 sm:gap-2 ${getGridColsClass()}`}>
         {tiles.map((tile) => (
           <Tile

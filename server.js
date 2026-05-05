@@ -43,8 +43,8 @@ io.on('connection', (socket) => {
 
   // --- PUBLIC MATCHMAKING ---
   socket.on('join_matchmaking', (data) => {
-    const requestedLevel = data.level; // "Easy", "Medium", "Hard", or "Random"
-    
+    const { level: requestedLevel, profile } = data; // "Easy", "Medium", "Hard", or "Random"
+
     // Safety check
     if (!waitingPools.hasOwnProperty(requestedLevel)) return;
 
@@ -52,45 +52,56 @@ io.on('connection', (socket) => {
       // Match found
       const waitingPlayer = waitingPools[requestedLevel];
       const roomName = `room_public_${waitingPlayer.socket.id}_${socket.id}`;
-      
+
       socket.join(roomName);
       waitingPlayer.socket.join(roomName);
-      
+
       const seed = Math.floor(Math.random() * 100000);
-      
+
       // Determine actual level if queue was Random
       let actualLevel = requestedLevel;
       if (requestedLevel === 'Random') {
         const levels = ["Easy", "Medium", "Hard"];
         actualLevel = levels[Math.floor(Math.random() * levels.length)];
       }
-      
-      io.to(roomName).emit('match_found', {
+
+      const basePayload = {
         room: roomName,
         seed: seed,
         level: actualLevel,
-        timeLimit: null // Use default
+        timeLimit: null
+      };
+
+      io.to(socket.id).emit('match_found', {
+        ...basePayload,
+        opponentProfile: waitingPlayer.profile
       });
-      
+      io.to(waitingPlayer.socket.id).emit('match_found', {
+        ...basePayload,
+        opponentProfile: profile
+      });
+
       console.log(`Public match created: ${roomName} (${actualLevel})`);
       waitingPools[requestedLevel] = null;
     } else {
       // Enter queue
-      waitingPools[requestedLevel] = { socket, level: requestedLevel };
+      waitingPools[requestedLevel] = { socket, level: requestedLevel, profile };
       socket.emit('waiting_for_opponent');
     }
   });
 
   // --- PRIVATE ROOMS ---
-  socket.on('create_private_room', () => {
+  socket.on('create_private_room', (data) => {
     const code = generateRoomCode();
     const roomName = `room_private_${code}`;
-    
+
     socket.join(roomName);
     privateRooms[code] = {
       roomName,
       host: socket.id,
       guest: null,
+      hostProfile: data?.profile || null,
+      guestProfile: null,
       settings: getDefaultRoomSettings(),
       lastSolverId: null
     };
@@ -100,16 +111,17 @@ io.on('connection', (socket) => {
   });
 
   socket.on('join_private_room', (data) => {
-    const { code } = data;
+    const { code, profile } = data;
     const roomInfo = privateRooms[code];
-    
+
     if (roomInfo && !roomInfo.guest && roomInfo.host !== socket.id) {
       socket.join(roomInfo.roomName);
       roomInfo.guest = socket.id;
-      
-      socket.emit('room_joined_success', { code, settings: roomInfo.settings });
+      roomInfo.guestProfile = profile || null;
+
+      socket.emit('room_joined_success', { code, settings: roomInfo.settings, hostProfile: roomInfo.hostProfile });
       // Notify host
-      socket.to(roomInfo.roomName).emit('guest_joined');
+      socket.to(roomInfo.roomName).emit('guest_joined', { guestProfile: roomInfo.guestProfile });
       console.log(`User joined private room: ${code}`);
     } else {
       socket.emit('room_join_failed', { message: "Invalid room code or room is full." });
@@ -200,7 +212,7 @@ io.on('connection', (socket) => {
       sentAt: Date.now()
     });
   });
-  
+
   socket.on('game_won', (data) => {
     socket.to(data.room).emit('opponent_won');
   });
@@ -230,6 +242,6 @@ io.on('connection', (socket) => {
 });
 
 const PORT = 3001;
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`Socket.IO server running on port ${PORT}`);
 });

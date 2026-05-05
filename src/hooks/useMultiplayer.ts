@@ -44,7 +44,7 @@ export type RoomSettings = {
 
 export function useMultiplayer() {
   const [socket, setSocket] = useState<Socket | null>(null);
-  
+
   // Game State
   const [isWaiting, setIsWaiting] = useState(false);
   const [room, setRoom] = useState<string | null>(null);
@@ -54,7 +54,7 @@ export function useMultiplayer() {
   const [activeMode, setActiveMode] = useState<GameMode>("normal");
   const [myRole, setMyRole] = useState<PlayerRole>("solver");
   const [isLiveCaptureEnabled, setIsLiveCaptureEnabled] = useState(false);
-  
+
   // Progress State
   const [opponentProgress, setOpponentProgress] = useState(0);
   const [opponentMatchedIndices, setOpponentMatchedIndices] = useState<number[]>([]);
@@ -62,6 +62,7 @@ export function useMultiplayer() {
   const [activeInterference, setActiveInterference] = useState<InterferencePayload | null>(null);
   const [activeSabotage, setActiveSabotage] = useState<SabotagePayload | null>(null);
   const [activePowerupAction, setActivePowerupAction] = useState<PowerupPayload | null>(null);
+  const [opponentProfile, setOpponentProfile] = useState<{ gamerName: string; photoDataUrl?: string } | null>(null);
   const [opponentTileSnapshot, setOpponentTileSnapshot] = useState<any[] | null>(null);
   const [opponentFrameDataUrl, setOpponentFrameDataUrl] = useState<string | null>(null);
   const [opponentWon, setOpponentWon] = useState(false);
@@ -80,7 +81,7 @@ export function useMultiplayer() {
 
   useEffect(() => {
     // Connect to the local Socket.IO server
-    const newSocket = io("http://localhost:3001");
+    const newSocket = io(`http://${window.location.hostname}:3001`);
     setSocket(newSocket);
 
     return () => {
@@ -104,6 +105,7 @@ export function useMultiplayer() {
       mode?: GameMode;
       roles?: Record<string, PlayerRole>;
       liveCaptureEnabled?: boolean;
+      opponentProfile?: { gamerName: string; photoDataUrl?: string };
     }) => {
       setIsWaiting(false);
       setRoom(data.room);
@@ -111,6 +113,9 @@ export function useMultiplayer() {
       setActualLevel(data.level);
       setActiveMode(data.mode || "normal");
       setIsLiveCaptureEnabled(!!data.liveCaptureEnabled);
+      if (data.opponentProfile) {
+        setOpponentProfile(data.opponentProfile);
+      }
       if (socket.id && data.roles?.[socket.id]) {
         setMyRole(data.roles[socket.id]);
       } else {
@@ -131,9 +136,10 @@ export function useMultiplayer() {
       setIsLiveCaptureEnabled(data.settings.liveCaptureEnabled);
       setIsHost(true);
       setOpponentJoined(false);
+      setOpponentProfile(null);
     });
 
-    socket.on("room_joined_success", (data: { code: string; settings: RoomSettings }) => {
+    socket.on("room_joined_success", (data: { code: string; settings: RoomSettings; hostProfile?: any }) => {
       setRoomCode(data.code);
       setRoomSettings(data.settings);
       setActiveMode(data.settings.mode);
@@ -141,6 +147,9 @@ export function useMultiplayer() {
       setIsHost(false);
       setOpponentJoined(true);
       setJoinError(null);
+      if (data.hostProfile) {
+        setOpponentProfile(data.hostProfile);
+      }
     });
 
     socket.on("room_join_failed", (data: { message: string }) => {
@@ -148,12 +157,16 @@ export function useMultiplayer() {
       setRoomCode(null);
     });
 
-    socket.on("guest_joined", () => {
+    socket.on("guest_joined", (data?: { guestProfile?: any }) => {
       setOpponentJoined(true);
+      if (data?.guestProfile) {
+        setOpponentProfile(data.guestProfile);
+      }
     });
 
     socket.on("guest_left", () => {
       setOpponentJoined(false);
+      setOpponentProfile(null);
     });
 
     socket.on("settings_updated", (newSettings: RoomSettings) => {
@@ -227,6 +240,7 @@ export function useMultiplayer() {
     setActiveInterference(null);
     setActiveSabotage(null);
     setActivePowerupAction(null);
+    setOpponentProfile(null);
     setOpponentTileSnapshot(null);
     setOpponentFrameDataUrl(null);
     setOpponentWon(false);
@@ -236,24 +250,24 @@ export function useMultiplayer() {
     setJoinError(null);
   };
 
-  const joinMatchmaking = useCallback((level: LevelType | "Random") => {
+  const joinMatchmaking = useCallback((level: LevelType | "Random", profile?: any) => {
     if (socket) {
       resetState();
-      socket.emit("join_matchmaking", { level });
+      socket.emit("join_matchmaking", { level, profile });
     }
   }, [socket]);
 
-  const createPrivateRoom = useCallback(() => {
+  const createPrivateRoom = useCallback((profile?: any) => {
     if (socket) {
       resetState();
-      socket.emit("create_private_room");
+      socket.emit("create_private_room", { profile });
     }
   }, [socket]);
 
-  const joinPrivateRoom = useCallback((code: string) => {
+  const joinPrivateRoom = useCallback((code: string, profile?: any) => {
     if (socket) {
       resetState();
-      socket.emit("join_private_room", { code: code.toUpperCase() });
+      socket.emit("join_private_room", { code: code.toUpperCase(), profile });
     }
   }, [socket]);
 
@@ -299,7 +313,7 @@ export function useMultiplayer() {
       socket.emit("send_video_frame", { room, frameDataUrl });
     }
   }, [socket, room, isLiveCaptureEnabled]);
-  
+
   const notifyWin = useCallback(() => {
     if (socket && room) {
       socket.emit("game_won", { room });
@@ -316,14 +330,14 @@ export function useMultiplayer() {
     activeMode,
     myRole,
     isLiveCaptureEnabled,
-    
+
     // Private Room state
     roomCode,
     isHost,
     roomSettings,
     opponentJoined,
     joinError,
-    
+
     // In-game state
     opponentProgress,
     opponentMatchedIndices,
@@ -331,10 +345,11 @@ export function useMultiplayer() {
     activeInterference,
     activeSabotage,
     activePowerupAction,
+    opponentProfile,
     opponentTileSnapshot,
     opponentFrameDataUrl,
     opponentWon,
-    
+
     // Methods
     joinMatchmaking,
     createPrivateRoom,

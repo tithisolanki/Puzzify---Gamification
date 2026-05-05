@@ -29,16 +29,17 @@ export function Tile({ id, bgPositionX, bgPositionY, imageUrl, cols, rows, isSel
   return (
     <div 
       className={`relative w-full aspect-square cursor-pointer transition-all duration-500 ease-in-out 
-        ${isSelected ? 'scale-95 shadow-[0_0_20px_rgba(255,77,157,1)] z-20' : ''} 
+        ${isSelected ? 'scale-95 shadow-[0_0_30px_rgba(255,77,157,1)] z-20' : ''} 
         ${isError ? 'shake-error' : ''} 
-        ${isMatched ? 'animate-pulse-glow z-10 pointer-events-none' : 'hover:-translate-y-1 hover:shadow-lg hover:z-30'}`}
+        ${isMatched ? 'animate-pulse-glow z-10 pointer-events-none' : 'hover:-translate-y-1 hover:shadow-[0_16px_30px_rgba(0,0,0,0.45)] hover:z-30'}`}
       onClick={handleClick}
       style={{
-        transformStyle: 'preserve-3d'
+        transformStyle: 'preserve-3d',
+        clipPath: "polygon(10% 0%, 100% 0%, 100% 90%, 90% 100%, 0% 100%, 0% 10%)"
       }}
     >
       <div className={`absolute inset-0 rounded-xl overflow-hidden flex items-center justify-center transition-all duration-300
-        ${isSelected ? 'border-2 border-[var(--accent)]' : isMatched ? 'border-2 border-green-500 shadow-[0_0_15px_rgba(34,197,94,0.5)]' : 'border border-white/20 glass-panel'}`}>
+        ${isSelected ? 'border-2 border-[var(--accent)]' : isMatched ? 'border-2 border-green-500 shadow-[0_0_18px_rgba(34,197,94,0.6)]' : 'border border-cyan-200/30 glass-panel'}`}>
         
         <div 
           className="w-full h-full transition-opacity duration-300"
